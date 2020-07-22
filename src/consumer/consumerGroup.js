@@ -475,7 +475,7 @@ module.exports = class ConsumerGroup {
 
   async recoverFromFetch(e) {
     if (STALE_METADATA_ERRORS.includes(e.type) || e.name === 'KafkaJSTopicMetadataNotLoaded') {
-      this.logger.debug('Stale cluster metadata, refreshing...', {
+      this.logger.error('Stale cluster metadata, refreshing...', {
         groupId: this.groupId,
         memberId: this.memberId,
         error: e.message,
@@ -488,7 +488,7 @@ module.exports = class ConsumerGroup {
     }
 
     if (e.name === 'KafkaJSStaleTopicMetadataAssignment') {
-      this.logger.warn(`${e.message}, resync group`, {
+      this.logger.error(`${e.message}, resync group`, {
         groupId: this.groupId,
         memberId: this.memberId,
         topic: e.topic,
@@ -504,7 +504,7 @@ module.exports = class ConsumerGroup {
     }
 
     if (e.name === 'KafkaJSBrokerNotFound') {
-      this.logger.debug(`${e.message}, refreshing metadata and retrying...`)
+      this.logger.error(`${e.message}, refreshing metadata and retrying...`)
       await this.cluster.refreshMetadata()
     }
 
