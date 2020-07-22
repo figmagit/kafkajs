@@ -434,7 +434,7 @@ module.exports = class Runner extends EventEmitter {
           return bail(e)
         }
 
-        this.logger.debug('Error while fetching data, trying again...', {
+        this.logger.error('Error while fetching data, trying again...', {
           groupId: this.consumerGroup.groupId,
           memberId: this.consumerGroup.memberId,
           error: e.message,
@@ -519,7 +519,7 @@ module.exports = class Runner extends EventEmitter {
           return bail(e)
         }
 
-        this.logger.debug('Error while committing offsets, trying again...', {
+        this.logger.error('Error while committing offsets, trying again...', {
           groupId: this.consumerGroup.groupId,
           memberId: this.consumerGroup.memberId,
           error: e.message,
