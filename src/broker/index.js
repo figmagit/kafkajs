@@ -14,6 +14,7 @@ const PRIVATE = {
  * Each node in a Kafka cluster is called broker. This class contains
  * the high-level operations a node can perform.
  *
+ * @type {import("../../types").Broker}
  * @param {Connection} connection
  * @param {Object} logger
  * @param {Object} [versions=null] The object with all available versions and APIs
@@ -180,9 +181,9 @@ module.exports = class Broker {
 
   /**
    * @public
+   * @type {import("../../types").Broker['metadata']}
    * @param {Array} [topics=[]] An array of topics to fetch metadata for.
    *                            If no topics are specified fetch metadata for all topics
-   * @returns {Promise}
    */
   async metadata(topics = []) {
     const metadata = this.lookupRequest(apiKeys.Metadata, requests.Metadata)
@@ -285,6 +286,8 @@ module.exports = class Broker {
    *                            ]
    *                          }
    *                        ]
+   * @param {string} rackId='' A rack identifier for this client. This can be any string value which indicates where this
+   *                           client is physically located. It corresponds with the broker config `broker.rack`.
    * @returns {Promise}
    */
   async fetch({
@@ -294,11 +297,12 @@ module.exports = class Broker {
     minBytes = 1,
     maxBytes = 10485760,
     topics,
+    rackId = '',
   }) {
     // TODO: validate topics not null/empty
     const fetch = this.lookupRequest(apiKeys.Fetch, requests.Fetch)
     return await this.connection.send(
-      fetch({ replicaId, isolationLevel, maxWaitTime, minBytes, maxBytes, topics })
+      fetch({ replicaId, isolationLevel, maxWaitTime, minBytes, maxBytes, topics, rackId })
     )
   }
 
@@ -348,16 +352,27 @@ module.exports = class Broker {
     groupProtocols,
   }) {
     const joinGroup = this.lookupRequest(apiKeys.JoinGroup, requests.JoinGroup)
-    return await this.connection.send(
-      joinGroup({
-        groupId,
-        sessionTimeout,
-        rebalanceTimeout,
-        memberId,
-        protocolType,
-        groupProtocols,
-      })
-    )
+    const makeRequest = (assignedMemberId = memberId) =>
+      this.connection.send(
+        joinGroup({
+          groupId,
+          sessionTimeout,
+          rebalanceTimeout,
+          memberId: assignedMemberId,
+          protocolType,
+          groupProtocols,
+        })
+      )
+
+    try {
+      return await makeRequest()
+    } catch (error) {
+      if (error.name === 'KafkaJSMemberIdRequired') {
+        return makeRequest(error.memberId)
+      }
+
+      throw error
+    }
   }
 
   /**
@@ -690,6 +705,17 @@ module.exports = class Broker {
   async listGroups() {
     const listGroups = this.lookupRequest(apiKeys.ListGroups, requests.ListGroups)
     return await this.connection.send(listGroups())
+  }
+
+  /**
+   * Send request to delete groups
+   * @param {Array<string>} groupIds
+   * @public
+   * @returns {Promise}
+   */
+  async deleteGroups(groupIds) {
+    const deleteGroups = this.lookupRequest(apiKeys.DeleteGroups, requests.DeleteGroups)
+    return await this.connection.send(deleteGroups(groupIds))
   }
 
   /***

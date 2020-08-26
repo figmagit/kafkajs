@@ -1,10 +1,11 @@
 const createRetry = require('../retry')
+const flatten = require('../utils/flatten')
 const waitFor = require('../utils/waitFor')
 const createConsumer = require('../consumer')
 const InstrumentationEventEmitter = require('../instrumentation/emitter')
 const { events, wrap: wrapEvent, unwrap: unwrapEvent } = require('./instrumentationEvents')
 const { LEVELS } = require('../loggers')
-const { KafkaJSNonRetriableError } = require('../errors')
+const { KafkaJSNonRetriableError, KafkaJSDeleteGroupsError } = require('../errors')
 const RESOURCE_TYPES = require('../protocol/resourceTypes')
 
 const { CONNECT, DISCONNECT } = events
@@ -43,10 +44,20 @@ const findTopicPartitions = async (cluster, topic) => {
     .sort()
 }
 
+/**
+ *
+ * @param {Object} params
+ * @param {import("../../types").Logger} params.logger
+ * @param {import('../instrumentation/emitter')} [params.instrumentationEmitter]
+ * @param {import('../../types').RetryOptions} params.retry
+ * @param {import("../../types").Cluster} params.cluster
+ *
+ * @returns {import("../../types").Admin}
+ */
 module.exports = ({
   logger: rootLogger,
   instrumentationEmitter: rootInstrumentationEmitter,
-  retry = { retries: 5 },
+  retry,
   cluster,
 }) => {
   const logger = rootLogger.namespace('Admin')
@@ -66,6 +77,15 @@ module.exports = ({
   const disconnect = async () => {
     await cluster.disconnect()
     instrumentationEmitter.emit(DISCONNECT)
+  }
+
+  /**
+   * @return {Promise}
+   */
+  const listTopics = async () => {
+    const { topicMetadata } = await cluster.metadata()
+    const topics = topicMetadata.map(t => t.topic)
+    return topics
   }
 
   /**
@@ -105,6 +125,7 @@ module.exports = ({
           const topicNamesArray = Array.from(topicNames.values())
           await retryOnLeaderNotAvailable(async () => await broker.metadata(topicNamesArray), {
             delay: 100,
+            maxWait: timeout,
             timeoutMessage: 'Timed out while waiting for topic leaders',
           })
         }
@@ -260,6 +281,63 @@ module.exports = ({
           high: offset,
           low: lowPartitions.find(({ partition: lowPartition }) => lowPartition === partition)
             .offset,
+        }))
+      } catch (e) {
+        if (e.type === 'UNKNOWN_TOPIC_OR_PARTITION') {
+          await cluster.refreshMetadata()
+          throw e
+        }
+
+        bail(e)
+      }
+    })
+  }
+
+  /**
+   * @param {string} topic
+   * @param {number} [timestamp]
+   */
+
+  const fetchTopicOffsetsByTimestamp = async (topic, timestamp) => {
+    if (!topic || typeof topic !== 'string') {
+      throw new KafkaJSNonRetriableError(`Invalid topic ${topic}`)
+    }
+
+    const retrier = createRetry(retry)
+
+    return retrier(async (bail, retryCount, retryTime) => {
+      try {
+        await cluster.addTargetTopic(topic)
+        await cluster.refreshMetadataIfNecessary()
+
+        const metadata = cluster.findTopicPartitionMetadata(topic)
+        const partitions = metadata.map(p => ({ partition: p.partitionId }))
+
+        const high = await cluster.fetchTopicsOffset([
+          {
+            topic,
+            fromBeginning: false,
+            partitions,
+          },
+        ])
+        const { partitions: highPartitions } = high.pop()
+
+        const offsets = await cluster.fetchTopicsOffset([
+          {
+            topic,
+            fromTimestamp: timestamp,
+            partitions,
+          },
+        ])
+        const { partitions: lowPartitions } = offsets.pop()
+
+        return lowPartitions.map(({ partition, offset }) => ({
+          partition,
+          offset:
+            parseInt(offset, 10) >= 0
+              ? offset
+              : highPartitions.find(({ partition: highPartition }) => highPartition === partition)
+                  .offset,
         }))
       } catch (e) {
         if (e.type === 'UNKNOWN_TOPIC_OR_PARTITION') {
@@ -592,7 +670,7 @@ module.exports = ({
       topics: await Promise.all(
         targetTopics.map(async topic => ({
           name: topic,
-          partitions: await cluster.findTopicPartitionMetadata(topic),
+          partitions: cluster.findTopicPartitionMetadata(topic),
         }))
       ),
     }
@@ -686,16 +764,138 @@ module.exports = ({
    * @property {string} protocolType
    */
   const listGroups = async () => {
+    await cluster.refreshMetadata()
     let groups = []
     for (var nodeId in cluster.brokerPool.brokers) {
-      await cluster.refreshMetadata()
-
       const broker = await cluster.findBroker({ nodeId })
       const response = await broker.listGroups()
       groups = groups.concat(response.groups)
     }
 
     return { groups }
+  }
+
+  /**
+   * Describe groups by group ids
+   * @param {Array<string>} groupIds
+   *
+   * @typedef {Object} GroupDescriptions
+   * @property {Array<GroupDescription>} groups
+   *
+   * @return {Promise<GroupDescriptions>}
+   */
+  const describeGroups = async groupIds => {
+    const coordinatorsForGroup = await Promise.all(
+      groupIds.map(async groupId => {
+        const coordinator = await cluster.findGroupCoordinator({ groupId })
+        return {
+          coordinator,
+          groupId,
+        }
+      })
+    )
+
+    const groupsByCoordinator = Object.values(
+      coordinatorsForGroup.reduce((coordinators, { coordinator, groupId }) => {
+        const group = coordinators[coordinator.nodeId]
+
+        if (group) {
+          coordinators[coordinator.nodeId] = {
+            ...group,
+            groupIds: [...group.groupIds, groupId],
+          }
+        } else {
+          coordinators[coordinator.nodeId] = { coordinator, groupIds: [groupId] }
+        }
+        return coordinators
+      }, {})
+    )
+
+    const responses = await Promise.all(
+      groupsByCoordinator.map(async ({ coordinator, groupIds }) => {
+        const retrier = createRetry(retry)
+        const { groups } = await retrier(() => coordinator.describeGroups({ groupIds }))
+        return groups
+      })
+    )
+
+    const groups = [].concat.apply([], responses)
+
+    return { groups }
+  }
+
+  /**
+   * Delete groups in a broker
+   *
+   * @param {string[]} [groupIds]
+   * @return {Promise<DeleteGroups>}
+   *
+   * @typedef {Array} DeleteGroups
+   * @property {string} groupId
+   * @property {number} errorCode
+   */
+  const deleteGroups = async groupIds => {
+    if (!groupIds || !Array.isArray(groupIds)) {
+      throw new KafkaJSNonRetriableError(`Invalid groupIds array ${groupIds}`)
+    }
+
+    const invalidGroupId = groupIds.some(g => typeof g !== 'string')
+
+    if (invalidGroupId) {
+      throw new KafkaJSNonRetriableError(`Invalid groupId name: ${JSON.stringify(invalidGroupId)}`)
+    }
+
+    const retrier = createRetry(retry)
+
+    let results = []
+
+    let clonedGroupIds = groupIds.slice()
+
+    return retrier(async (bail, retryCount, retryTime) => {
+      try {
+        if (clonedGroupIds.length === 0) return []
+
+        await cluster.refreshMetadata()
+
+        const brokersPerGroups = {}
+        const brokersPerNode = {}
+        for (const groupId of clonedGroupIds) {
+          const broker = await cluster.findGroupCoordinator({ groupId })
+          if (brokersPerGroups[broker.nodeId] === undefined) brokersPerGroups[broker.nodeId] = []
+          brokersPerGroups[broker.nodeId].push(groupId)
+          brokersPerNode[broker.nodeId] = broker
+        }
+
+        const res = await Promise.all(
+          Object.keys(brokersPerNode).map(
+            async nodeId => await brokersPerNode[nodeId].deleteGroups(brokersPerGroups[nodeId])
+          )
+        )
+
+        const errors = flatten(
+          res.map(({ results }) =>
+            results.map(({ groupId, errorCode, error }) => {
+              return { groupId, errorCode, error }
+            })
+          )
+        ).filter(({ errorCode }) => errorCode !== 0)
+
+        clonedGroupIds = errors.map(({ groupId }) => groupId)
+
+        if (errors.length > 0) throw new KafkaJSDeleteGroupsError('Error in DeleteGroups', errors)
+
+        results = flatten(res.map(({ results }) => results))
+
+        return results
+      } catch (e) {
+        if (e.type === 'NOT_CONTROLLER' || e.type === 'COORDINATOR_NOT_AVAILABLE') {
+          logger.warn('Could not delete groups', { error: e.message, retryCount, retryTime })
+          throw e
+        }
+
+        bail(e)
+      }
+    })
   }
 
   /**
@@ -727,6 +927,7 @@ module.exports = ({
   return {
     connect,
     disconnect,
+    listTopics,
     createTopics,
     deleteTopics,
     createPartitions,
@@ -736,6 +937,7 @@ module.exports = ({
     events,
     fetchOffsets,
     fetchTopicOffsets,
+    fetchTopicOffsetsByTimestamp,
     setOffsets,
     resetOffsets,
     describeConfigs,
@@ -743,5 +945,7 @@ module.exports = ({
     on,
     logger: getLogger,
     listGroups,
+    describeGroups,
+    deleteGroups,
   }
 }

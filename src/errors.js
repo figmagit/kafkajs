@@ -34,6 +34,14 @@ class KafkaJSOffsetOutOfRange extends KafkaJSProtocolError {
   }
 }
 
+class KafkaJSMemberIdRequired extends KafkaJSProtocolError {
+  constructor(e, { memberId }) {
+    super(e)
+    this.memberId = memberId
+    this.name = 'KafkaJSMemberIdRequired'
+  }
+}
+
 class KafkaJSNumberOfRetriesExceeded extends KafkaJSNonRetriableError {
   constructor(e, { retryCount, retryTime }) {
     super(e)
@@ -85,6 +93,14 @@ class KafkaJSStaleTopicMetadataAssignment extends KafkaJSError {
     this.topic = topic
     this.unknownPartitions = unknownPartitions
     this.name = 'KafkaJSStaleTopicMetadataAssignment'
+  }
+}
+
+class KafkaJSDeleteGroupsError extends KafkaJSError {
+  constructor(e, groups = []) {
+    super(e)
+    this.groups = groups
+    this.name = 'KafkaJSDeleteGroupsError'
   }
 }
 
@@ -164,11 +180,13 @@ module.exports = {
   KafkaJSSASLAuthenticationError,
   KafkaJSNumberOfRetriesExceeded,
   KafkaJSOffsetOutOfRange,
+  KafkaJSMemberIdRequired,
   KafkaJSGroupCoordinatorNotFound,
   KafkaJSNotImplemented,
   KafkaJSMetadataNotLoaded,
   KafkaJSTopicMetadataNotLoaded,
   KafkaJSStaleTopicMetadataAssignment,
+  KafkaJSDeleteGroupsError,
   KafkaJSTimeout,
   KafkaJSLockTimeout,
   KafkaJSServerDoesNotSupportApiKey,

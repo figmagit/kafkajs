@@ -15,6 +15,8 @@ const requestInfo = ({ apiName, apiKey, apiVersion }) =>
  * @param {number} port
  * @param {Object} logger
  * @param {string} clientId='kafkajs'
+ * @param {number} requestTimeout The maximum amount of time the client will wait for the response of a request,
+ *                                in milliseconds
  * @param {string} [rack=null]
  * @param {Object} [ssl=null] Options for the TLS Secure Context. It accepts all options,
  *                            usually "cert", "key" and "ca". More information at
@@ -23,8 +25,6 @@ const requestInfo = ({ apiName, apiKey, apiVersion }) =>
  *                             key "mechanism". Connection is not actively using the SASL attributes
  *                             but acting as a data object for this information
  * @param {number} [connectionTimeout=1000] The connection timeout, in milliseconds
- * @param {number} [requestTimeout=30000] The maximum amount of time the client will wait for the response of a request,
- *                                        in milliseconds
  * @param {Object} [retry=null] Configurations for the built-in retry mechanism. More information at the
  *                              retry module inside network
  * @param {number} [maxInFlightRequests=null] The maximum number of unacknowledged requests on a connection before
@@ -37,12 +37,12 @@ module.exports = class Connection {
     port,
     logger,
     socketFactory,
+    requestTimeout,
     rack = null,
     ssl = null,
     sasl = null,
     clientId = 'kafkajs',
     connectionTimeout = 1000,
-    requestTimeout = 30000,
     enforceRequestTimeout = false,
     maxInFlightRequests = null,
     instrumentationEmitter = null,
@@ -64,12 +64,10 @@ module.exports = class Connection {
     this.requestTimeout = requestTimeout
     this.connectionTimeout = connectionTimeout
 
-    this.buffer = Buffer.alloc(0)
-    this.bufferQueue = {
-      bytesTotal: 0,
-      bytesAwaiting: 0,
-      buffers: [],
-    }
+    this.bytesBuffered = 0
+    this.bytesNeeded = Decoder.int32Size()
+    this.chunks = []
+
     this.connected = false
     this.correlationId = 0
     this.requestQueue = new RequestQueue({
@@ -201,15 +199,16 @@ module.exports = class Connection {
    * @returns {Promise}
    */
   async disconnect() {
-    if (!this.connected) {
-      return true
+    this.logDebug('disconnecting...')
+    this.connected = false
+
+    this.requestQueue.destroy()
+
+    if (this.socket) {
+      this.socket.end()
+      this.socket.unref()
     }
 
-    this.logDebug('disconnecting...')
-    this.requestQueue.destroy()
-    this.connected = false
-    this.socket.end()
-    this.socket.unref()
     this.logDebug('disconnected')
     return true
   }
@@ -316,6 +315,8 @@ module.exports = class Connection {
 
     try {
       const payloadDecoded = await response.decode(payload)
+      // KIP-219: If the response indicates that the client-side needs to throttle, do that.
+      this.requestQueue.maybeThrottle(payloadDecoded.clientSideThrottleTime)
       const data = await response.parse(payloadDecoded)
       const isFetchApi = entry.apiName === 'Fetch'
       this.logDebug(`Response ${requestInfo(entry)}`, {
@@ -376,40 +377,36 @@ module.exports = class Connection {
       return this.authHandlers.onSuccess(rawData)
     }
 
-    this.bufferQueue.buffers.push(rawData)
-    this.bufferQueue.bytesTotal += Buffer.byteLength(rawData)
-
-    const bytesTotal = Buffer.byteLength(this.buffer) + this.bufferQueue.bytesTotal
-    if (this.bufferQueue.bytesAwaiting <= bytesTotal) {
-      this.buffer = Buffer.concat([this.buffer, ...this.bufferQueue.buffers])
-      this.bufferQueue.bytesTotal = 0
-      this.bufferQueue.bytesAwaiting = Decoder.int32Size()
-      this.bufferQueue.buffers = []
-    } else {
-      return
-    }
+    // Accumulate the new chunk
+    this.chunks.push(rawData)
+    this.bytesBuffered += Buffer.byteLength(rawData)
 
     // Process data if there are enough bytes to read the expected response size,
     // otherwise keep buffering
-    while (Buffer.byteLength(this.buffer) > Decoder.int32Size()) {
-      const data = Buffer.from(this.buffer)
-      const decoder = new Decoder(data)
+    while (this.bytesNeeded <= this.bytesBuffered) {
+      const buffer = this.chunks.length > 1 ? Buffer.concat(this.chunks) : this.chunks[0]
+      const decoder = new Decoder(buffer)
       const expectedResponseSize = decoder.readInt32()
 
+      // Return early if not enough bytes to read the full response
       if (!decoder.canReadBytes(expectedResponseSize)) {
-        this.bufferQueue.bytesAwaiting = Decoder.int32Size() + expectedResponseSize
+        this.chunks = [buffer]
+        this.bytesBuffered = Buffer.byteLength(buffer)
+        this.bytesNeeded = Decoder.int32Size() + expectedResponseSize
         return
-      } else {
-        this.bufferQueue.bytesAwaiting = Decoder.int32Size()
       }
 
       const response = new Decoder(decoder.readBytes(expectedResponseSize))
-      // Reset the buffer as the rest of the bytes
-      this.buffer = decoder.readAll()
+
+      // Reset the buffered chunks as the rest of the bytes
+      const remainderBuffer = decoder.readAll()
+      this.chunks = [remainderBuffer]
+      this.bytesBuffered = Buffer.byteLength(remainderBuffer)
+      this.bytesNeeded = Decoder.int32Size()
 
       if (this.authHandlers) {
         const rawResponseSize = Decoder.int32Size() + expectedResponseSize
-        const rawResponseBuffer = data.slice(0, rawResponseSize)
+        const rawResponseBuffer = buffer.slice(0, rawResponseSize)
         return this.authHandlers.onSuccess(rawResponseBuffer)
       }
 
